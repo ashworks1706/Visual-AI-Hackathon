@@ -1,106 +1,97 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from twilio.rest import Client
-import face_recognition
-import os
+from collections import defaultdict
 import time
 
-# Initialize models
-scooter_model = YOLO('yolov8n.pt')  # Base model
-tool_model = YOLO('yolov8s-custom.pt')  # Custom trained on tools dataset
-lock_model = YOLO('yolov8s-lock-segmentation.pt')  # Lock segmentation model
+# Initialize YOLO model for person and scooter detection
+model = YOLO('yolov8n.pt')  # Replace with custom-trained model if needed
 
-# Twilio setup
-TWILIO_SID = 'your_account_sid'
-TWILIO_TOKEN = 'your_auth_token'
-client = Client(TWILIO_SID, TWILIO_TOKEN)
+# Dictionary to store scooter and associated user features
+scooter_registry = defaultdict(dict)
 
-# Face recognition setup
-known_face_encodings = []
-known_face_names = []
+# Helper function to extract dominant color from a bounding box
+def extract_dominant_color(image, bbox):
+    x1, y1, x2, y2 = map(int, bbox)
+    cropped = image[y1:y2, x1:x2]
+    avg_color = cv2.mean(cropped)[:3]
+    return tuple(map(int, avg_color))
 
-def load_owner_profile(owner_image_path):
-    global known_face_encodings, known_face_names
-    owner_image = face_recognition.load_image_file(owner_image_path)
-    owner_encoding = face_recognition.face_encodings(owner_image)[0]
-    known_face_encodings.append(owner_encoding)
-    known_face_names.append("Owner")
+# Function to check if two colors are similar
+def is_color_similar(color1, color2, threshold=50):
+    return sum(abs(c1 - c2) for c1, c2 in zip(color1, color2)) < threshold
 
-def send_alert(frame):
-    filename = f"alert_{time.time()}.jpg"
-    cv2.imwrite(filename, frame)
-    message = client.messages.create(
-        body='Scooter theft attempt detected!',
-        from_='+1234567890',
-        to='+0987654321',
-        media_url=[filename]
-    )
-    os.remove(filename)
-
+# Main function to process video feed
 def main(video_source=0):
     cap = cv2.VideoCapture(video_source)
-    scooter_parked = False
-    owner_present = False
-    lock_status = "locked"
-    parked_position = None
-    
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
             break
-
-        # Scooter detection
-        scooter_results = scooter_model(frame, classes=[67])  # Class 67 for scooter
-        if scooter_results[0].boxes:
-            scooter_box = scooter_results[0].boxes.xyxy[0].cpu().numpy()
-            parked_position = scooter_box
-            cv2.rectangle(frame, (int(scooter_box[0]), int(scooter_box[1])),
-                         (int(scooter_box[2]), int(scooter_box[3])), (0,255,0), 2)
-
-        # Face recognition for owner
-        face_locations = face_recognition.face_locations(frame)
-        face_encodings = face_recognition.face_encodings(frame, face_locations)
         
-        for face_encoding in face_encodings:
-            matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
-            if True in matches:
-                owner_present = True
-                scooter_parked = True
+        results = model(frame)
+        detections = results[0].boxes.xyxy.cpu().numpy()
+        classes = results[0].boxes.cls.cpu().numpy()
+        confidences = results[0].boxes.conf.cpu().numpy()
 
-        # Tool detection near scooter
-        if scooter_parked and not owner_present:
-            tool_results = tool_model(frame, classes=[22, 44, 76])  # Classes for tools
-            if tool_results[0].boxes:
-                for box in tool_results[0].boxes.xyxy.cpu().numpy():
-                    if parked_position and box_overlap(parked_position, box):
-                        cv2.putText(frame, "THEFT ATTEMPT!", (10, 50),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 3)
-                        send_alert(frame)
+        current_scooters = []
+        current_people = []
 
-        # Lock status detection
-        lock_results = lock_model(frame)
-        if lock_results[0].masks:
-            lock_status = "intact" if check_lock_integrity(lock_results) else "broken"
+        # Process detections
+        for bbox, cls, conf in zip(detections, classes, confidences):
+            if conf < 0.5:
+                continue
+            
+            if int(cls) == 67:  # Scooter class
+                current_scooters.append(bbox)
+                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 255, 0), 2)
+                cv2.putText(frame, "Scooter", (int(bbox[0]), int(bbox[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            elif int(cls) == 0:  # Person class
+                current_people.append(bbox)
+                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255, 0, 0), 2)
+                cv2.putText(frame, "Person", (int(bbox[0]), int(bbox[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-        cv2.imshow('Scooter Security', frame)
+        # Associate people with scooters
+        for scooter_bbox in current_scooters:
+            for person_bbox in current_people:
+                # Check proximity between person and scooter
+                if is_nearby(scooter_bbox, person_bbox):
+                    dominant_color = extract_dominant_color(frame, person_bbox)
+                    scooter_registry[tuple(scooter_bbox)]["features"] = dominant_color
+                    scooter_registry[tuple(scooter_bbox)]["timestamp"] = time.time()
+                    break
+
+        # Detect suspicious activity
+        for scooter_bbox in current_scooters:
+            scooter_key = tuple(scooter_bbox)
+            if scooter_key in scooter_registry:
+                registered_features = scooter_registry[scooter_key]["features"]
+                for person_bbox in current_people:
+                    dominant_color = extract_dominant_color(frame, person_bbox)
+                    if not is_color_similar(registered_features, dominant_color):
+                        # Alert: Unauthorized access detected!
+                        cv2.putText(frame, "ALERT! Unauthorized Access", (50, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                                    1.0, (0, 0, 255), 3)
+                        print("ALERT: Unauthorized access detected!")
+
+        cv2.imshow("Scooter Theft Detection", frame)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
-def box_overlap(box1, box2):
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    return x1 < x2 and y1 < y2
+# Helper function to check proximity between two bounding boxes
+def is_nearby(box1, box2):
+    x1_center = (box1[0] + box1[2]) / 2
+    y1_center = (box1[1] + box1[3]) / 2
+    x2_center = (box2[0] + box2[2]) / 2
+    y2_center = (box2[1] + box2[3]) / 2
 
-def check_lock_integrity(lock_results):
-    # Implement lock integrity check logic
-    return True
+    distance = np.sqrt((x1_center - x2_center)**2 + (y1_center - y2_center)**2)
+    return distance < 100
 
 if __name__ == "__main__":
-    load_owner_profile("owner.jpg")
-    main("parking_lot.mp4")
+    main("../public/parking_lot.mp4")  # Replace with your video file or camera feed
