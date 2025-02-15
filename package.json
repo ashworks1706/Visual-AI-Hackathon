@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "concurrently \"next dev --turbopack\" \"cd api && flask run --port 5328\"",
+    "dev": "concurrently \"next dev --turbopack\" \"(cd api && python -m venv venv || true && ./venv/bin/pip install -r requirements.txt && ./venv/bin/python -m flask run --port 5328)\"",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
@@ -12,8 +12,7 @@
     "concurrently": "^9.1.2",
     "next": "15.1.7",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "flask": "^2.0.0"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
